@@ -47,7 +47,12 @@ if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
     echo "Waiting for OpenCode Server to become available..."
     MAX_RETRIES=30
     COUNT=0
-    while ! curl -s http://127.0.0.1:${SERVER_PORT}/health > /dev/null; do
+    # The very first TCP connection to a freshly started OpenCode server is
+    # accepted but never answered, so an unbounded curl blocks here forever and
+    # the proxy never starts. A per-attempt timeout makes the loop retry, and the
+    # next connection is served normally. -f is omitted on purpose: with a server
+    # password set /health answers 401, which still means "listening".
+    while ! curl -s -m 5 http://127.0.0.1:${SERVER_PORT}/health > /dev/null; do
         if [ $COUNT -ge $MAX_RETRIES ]; then
             echo "Timeout waiting for OpenCode Server."
             kill $SERVER_PID 2>/dev/null

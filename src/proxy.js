@@ -397,44 +397,69 @@ function resolveOpencodePath(requestedPath) {
     return { path: null, source: 'not-found' };
 }
 
-function processQueue() {
-    if (isProcessing || queue.length === 0) return;
-    isProcessing = true;
-    const { task, timeout, resolve, reject } = queue.shift();
-    let settled = false;
-    const timeoutMs = timeout || 120000;
-    const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        reject(new Error(`Request timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
+// Concurrency gate.
+//
+// This used to be a single global mutex, which capped the proxy at exactly one
+// in-flight request: every caller queued behind the previous one, and because a
+// real turn can run for minutes, queued requests blew past the timeout and were
+// aborted with MessageAbortedError. Each request builds its own OpenCode session
+// and keeps its state in request-local variables, so unrelated requests are safe
+// to run in parallel. Same-session ordering is preserved by the per-session gate
+// below when a client pins a session key; without a key nothing is serialized.
+const MAX_CONCURRENT_REQUESTS = Number(process.env.OPENCODE_PROXY_MAX_CONCURRENCY) || 0; // 0 = unlimited
+let activeRequestCount = 0;
+const sessionQueues = new Map();
 
-    Promise.resolve()
-        .then(() => task())
-        .then((result) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            resolve(result);
-        })
-        .catch((err) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            reject(err);
-        })
-        .finally(() => {
-            isProcessing = false;
-            if (queue.length > 0) {
-                queueMicrotask(processQueue);
+// Serializes requests that share `key`. `wait` resolves when it is this
+// request's turn; `release` must be called exactly once to hand over.
+const acquireSessionGate = (key) => {
+    if (!key) {
+        activeRequestCount += 1;
+        let done = false;
+        return {
+            wait: Promise.resolve(),
+            release: () => {
+                if (done) return;
+                done = true;
+                activeRequestCount -= 1;
             }
-        });
-}
+        };
+    }
+    const previous = sessionQueues.get(key) || Promise.resolve();
+    let release;
+    const mine = new Promise(resolve => { release = resolve; });
+    // Chain past both fulfilled and rejected predecessors so a single failure
+    // cannot stall every later request on this key.
+    sessionQueues.set(key, previous.then(() => mine, () => mine));
+    mine.then(() => {
+        if (sessionQueues.get(key) === mine) sessionQueues.delete(key);
+    }).catch(() => {});
+    activeRequestCount += 1;
+    let done = false;
+    return {
+        wait: previous.then(() => {}, () => {}),
+        release: () => {
+            if (done) return;
+            done = true;
+            activeRequestCount -= 1;
+            release();
+        }
+    };
+};
+
+const acquireGlobalSlot = async () => {
+    if (MAX_CONCURRENT_REQUESTS > 0) {
+        while (activeRequestCount > MAX_CONCURRENT_REQUESTS) {
+            await new Promise(r => setTimeout(r, 50));
+        }
+    }
+};
 
 function lock(task, timeout = 120000) {
     return new Promise((resolve, reject) => {
-        queue.push({ task, timeout, resolve, reject });
-        processQueue();
+        Promise.resolve()
+            .then(() => task())
+            .then(resolve, reject);
     });
 }
 
@@ -697,6 +722,73 @@ export function createApp(config) {
         sweepResponseState().catch(() => {});
     }, RESPONSE_STATE_SWEEP_INTERVAL_MS);
     if (typeof responseStateSweepTimer.unref === 'function') responseStateSweepTimer.unref();
+
+    // Chat Completions session reuse.
+    //
+    // /v1/chat/completions is stateless on the wire: the client resends the entire
+    // message array on every turn. Creating a fresh OpenCode session per request
+    // therefore restarts the upstream conversation each time, which both discards
+    // the prior turns and defeats any provider-side prefix cache keyed on a stable
+    // session. So a client can pin a conversation: when it sends a stable key
+    // (the standard OpenAI `user` field, or an explicit `opencode.session_id`), we
+    // keep the same upstream session across turns.
+    //
+    // Opt-in only. Without a key, behaviour is unchanged (new session per request).
+    const CHAT_SESSION_TTL_MS = Number(process.env.OPENCODE_PROXY_CHAT_SESSION_TTL_MS) || 60 * 60 * 1000;
+    const chatSessions = new Map();
+
+    const getChatSessionKey = (req) => {
+        const body = req.body || {};
+        const explicit = body.opencode?.session_id || body.opencode?.sessionId;
+        if (typeof explicit === 'string' && explicit.trim() !== '') return `s:${explicit.trim()}`;
+        if (typeof body.user === 'string' && body.user.trim() !== '') return `u:${body.user.trim()}`;
+        return null;
+    };
+
+    const readChatSession = (key) => {
+        if (!key) return null;
+        const hit = chatSessions.get(key);
+        if (!hit) return null;
+        if (hit.expiresAt <= Date.now()) {
+            chatSessions.delete(key);
+            return null;
+        }
+        hit.expiresAt = Date.now() + CHAT_SESSION_TTL_MS;
+        return hit;
+    };
+
+    const writeChatSession = (key, sessionId, lastUserText) => {
+        if (!key || !sessionId) return;
+        chatSessions.set(key, { sessionId, lastUserText, expiresAt: Date.now() + CHAT_SESSION_TTL_MS });
+    };
+
+    const forgetChatSession = (key, sessionId) => {
+        if (!key) return;
+        const hit = chatSessions.get(key);
+        if (hit && hit.sessionId === sessionId) chatSessions.delete(key);
+    };
+
+    const sweepChatSessions = async () => {
+        const now = Date.now();
+        const dead = [];
+        for (const [key, value] of chatSessions.entries()) {
+            if (value.expiresAt <= now) {
+                chatSessions.delete(key);
+                dead.push(value);
+            }
+        }
+        for (const value of dead) {
+            try {
+                await client.session.delete({ path: { id: value.sessionId } });
+            } catch (e) {
+                logDebug('Failed to delete expired chat session', { sessionId: value.sessionId, error: e.message });
+            }
+        }
+    };
+    const chatSessionSweepTimer = setInterval(() => {
+        sweepChatSessions().catch(() => {});
+    }, RESPONSE_STATE_SWEEP_INTERVAL_MS);
+    if (typeof chatSessionSweepTimer.unref === 'function') chatSessionSweepTimer.unref();
 
     const TOOL_MODE = Object.freeze({
         DISABLED: 'disabled',
@@ -1490,7 +1582,12 @@ export function createApp(config) {
 
     // Chat completions endpoint
     app.post('/v1/chat/completions', async (req, res) => {
+        // Only requests pinned to the same conversation are serialized; everything
+        // else runs in parallel (see acquireSessionGate).
+        const chatSessionKey = getChatSessionKey(req);
+        const gate = acquireSessionGate(chatSessionKey);
         try {
+            await gate.wait;
             await lock(async () => {
                 let sessionId = null;
                 let eventStream = null;
@@ -1499,6 +1596,12 @@ export function createApp(config) {
                 let mID = 'kimi-k2.5-free';
                 let id = `chatcmpl-${crypto.randomUUID()}`;
                 let keepaliveInterval = null;
+                // Set once the turn produced a real answer, so the session is only
+                // pinned for reuse when the turn actually succeeded.
+                let turnCompleted = false;
+                // Declared out here because the finally block runs on a path where the
+                // request body destructuring below may never have executed.
+                let lastForwardedUserText = '';
 
                 try {
                     const { messages, model, tools = [], tool_choice, stream: requestStream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort, reasoning, opencode: requestOpencodeConfig } = req.body;
@@ -1651,7 +1754,44 @@ export function createApp(config) {
                 route: '/v1/chat/completions'
             });
 
-                    const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages, externalToolRegistry);
+                    // Locate where the pinned upstream session's transcript ends inside
+                    // the client's `messages` array.
+                    //
+                    // A plain index is not reliable: the client re-serializes assistant
+                    // turns between requests, so counting messages drifts out of sync
+                    // with what the session actually stored, and the boundary creeps
+                    // forward one message per turn. Instead we anchor on the last user
+                    // message the session already saw, matched by its text, then resume
+                    // at the next *user* message after it -- the anchor itself and the
+                    // assistant reply to it are already stored upstream and must not be
+                    // sent again. If no anchor is found (client restarted, edited
+                    // history, or the text no longer matches) we deliberately start a
+                    // fresh session rather than risk a duplicated transcript.
+                    const existingSession = readChatSession(chatSessionKey);
+                    let resumeIndex = -1;
+                    if (existingSession && existingSession.lastUserText) {
+                        const anchor = existingSession.lastUserText;
+                        for (let i = messages.length - 1; i >= 0; i -= 1) {
+                            const role = (messages[i]?.role || 'user').toLowerCase();
+                            if (role !== 'user') continue;
+                            const content = normalizeTextContent(messages[i]?.content);
+                            if (content && content === anchor) {
+                                for (let j = i + 1; j < messages.length; j += 1) {
+                                    if ((messages[j]?.role || 'user').toLowerCase() === 'user') {
+                                        resumeIndex = j;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    const messagesToSend = resumeIndex >= 0 && resumeIndex < messages.length
+                        ? messages.slice(resumeIndex)
+                        : messages;
+
+                    const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messagesToSend, externalToolRegistry);
+                    lastForwardedUserText = lastUserMsg || '';
                     const systemWithGuard = buildSystemPrompt(
                         [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
                         requestParams.reasoning_effort,
@@ -1691,11 +1831,17 @@ export function createApp(config) {
                         logDebug('Failed to set active model:', confError.message);
                     }
 
-                    // Create session
-                    const sessionRes = await client.session.create();
-                    sessionId = sessionRes.data?.id;
-                    if (!sessionId) throw new Error('Failed to create OpenCode session');
-                    logDebug('Session created', { sessionId });
+                    // Continue the pinned conversation when the anchor matched, otherwise
+                    // start a fresh upstream session.
+                    if (resumeIndex > 0 && resumeIndex < messages.length) {
+                        sessionId = existingSession.sessionId;
+                        logDebug('Session reused', { sessionId, resumedAt: resumeIndex });
+                    } else {
+                        const sessionRes = await client.session.create();
+                        sessionId = sessionRes.data?.id;
+                        if (!sessionId) throw new Error('Failed to create OpenCode session');
+                        logDebug('Session created', { sessionId });
+                    }
 
                     id = `chatcmpl-${crypto.randomUUID()}`;
                     keepaliveInterval = null;
@@ -2028,6 +2174,7 @@ export function createApp(config) {
                         })}\n\n`);
                         res.write('data: [DONE]\n\n');
                         res.end();
+                        turnCompleted = true;
                     } else {
                         let content = '';
                         let reasoning = '';
@@ -2133,6 +2280,7 @@ export function createApp(config) {
                                 }
                             }
                         });
+                        turnCompleted = true;
                     }
                 } catch (error) {
                     console.error('[Proxy] API Error:', error.message);
@@ -2148,6 +2296,10 @@ export function createApp(config) {
                         res.end();
                     }
                     if (sessionId) {
+                        // A reused session can be left half-written, so drop the pin
+                        // and let the next turn start clean rather than continuing a
+                        // corrupted transcript.
+                        forgetChatSession(chatSessionKey, sessionId);
                         try {
                             await client.session.delete({ path: { id: sessionId } });
                         } catch (e) {
@@ -2159,6 +2311,13 @@ export function createApp(config) {
                     if (eventStream && eventStream.close) {
                         eventStream.close();
                     }
+                    // Remember the session only after the turn finished cleanly, so the
+                    // next request continues the same upstream conversation. The stored
+                    // length is what lets the next turn send only its own new messages
+                    // instead of replaying the whole transcript.
+                    if (chatSessionKey && sessionId && turnCompleted && lastForwardedUserText) {
+                        writeChatSession(chatSessionKey, sessionId, lastForwardedUserText);
+                    }
                 }
             }, REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {
@@ -2166,6 +2325,8 @@ export function createApp(config) {
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: error.constructor.name } });
             }
+        } finally {
+            gate.release();
         }
     });
 
@@ -2199,6 +2360,12 @@ export function createApp(config) {
         res.json({
             status: 'ok',
             proxy: true,
+            concurrency: {
+                active_requests: activeRequestCount,
+                max_concurrent: MAX_CONCURRENT_REQUESTS || 'unlimited',
+                // Conversations currently pinned to a reused upstream session.
+                pinned_conversations: chatSessions.size
+            },
             internal_tools: {
                 config: {
                     allowed_tools: SERVER_INTERNAL_ALLOWED_TOOL_NAMES,
