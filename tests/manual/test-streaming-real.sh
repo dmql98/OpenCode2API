@@ -1,5 +1,5 @@
 #!/bin/bash
-# Manual smoke test against a live backend (Docker or local).
+# Manual smoke test against a live local backend.
 #
 # Not part of CI: requires real OpenCode models. Point BASE_URL at a
 # running proxy and set API_KEY to match its config.

@@ -45,6 +45,7 @@ const sdkMocks = {
         }
     ])),
     sessionDelete: jest.fn(async () => ({})),
+    sessionAbort: jest.fn(async () => ({})),
     eventSubscribe: jest.fn(async () => {
         const sessionId = 'test-session-id';
         const mockEvents = [
@@ -117,7 +118,8 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             create: sdkMocks.sessionCreate,
             prompt: sdkMocks.sessionPrompt,
             messages: sdkMocks.sessionMessages,
-            delete: sdkMocks.sessionDelete
+            delete: sdkMocks.sessionDelete,
+            abort: sdkMocks.sessionAbort
         },
         event: {
             subscribe: sdkMocks.eventSubscribe
@@ -310,6 +312,166 @@ describe('Proxy OpenAI API', () => {
         expect(promptCall.body.system).toContain('external__web_fetch');
         expect(promptCall.body.tools).toBeUndefined();
         expect(sdkMocks.toolIds).not.toHaveBeenCalled();
+    });
+
+    const readToolRequest = [
+        {
+            type: 'function',
+            function: {
+                name: 'read',
+                description: 'Read a file',
+                parameters: {
+                    type: 'object',
+                    properties: { path: { type: 'string' } },
+                    required: ['path']
+                }
+            }
+        }
+    ];
+
+    test('POST /v1/chat/completions polls back external__ tool calls rejected on OpenCode native channel', async () => {
+        // OpenCode only knows its own tools, so when the model calls this proxy's
+        // external__ tools directly on the native channel it answers "tool unavailable"
+        // and keeps talking. The rejection is the client's real answer, so it is scraped
+        // out of the transcript with the fallout narration cut off.
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'I will read the file.' }]
+            },
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'tool',
+                        id: 'part-tool-read',
+                        callID: 'call_native_read_1',
+                        tool: 'external__read',
+                        state: {
+                            status: 'error',
+                            input: { path: 'src/app.js' },
+                            error: { name: 'NoSuchToolError', message: 'unavailable' }
+                        }
+                    }
+                ]
+            },
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'I cannot use that tool.' }]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Read src/app.js' }],
+                tools: readToolRequest
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('tool_calls');
+        expect(res.body.choices[0].message.tool_calls).toEqual([
+            {
+                id: 'call_native_read_1',
+                type: 'function',
+                function: {
+                    name: 'read',
+                    arguments: JSON.stringify({ path: 'src/app.js' })
+                }
+            }
+        ]);
+        // The rejection's fallout must never reach the client next to the tool_calls
+        // it is about to execute.
+        expect(res.text).not.toContain('cannot use that tool');
+        expect(sdkMocks.sessionAbort).not.toHaveBeenCalled();
+    });
+
+    test('POST /v1/chat/completions streaming recovers external__ tool calls rejected on OpenCode native channel', async () => {
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            const sessionId = 'test-session-id';
+            const mockEvents = [
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'part-text', type: 'text', sessionID: sessionId },
+                        delta: 'Reading the file.'
+                    }
+                },
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: {
+                            id: 'part-tool-read',
+                            type: 'tool',
+                            sessionID: sessionId,
+                            tool: 'external__read',
+                            callID: 'call_native_read_1',
+                            state: {
+                                status: 'error',
+                                input: { path: 'src/app.js' },
+                                error: { name: 'NoSuchToolError', message: 'unavailable' }
+                            }
+                        }
+                    }
+                },
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'part-step', type: 'step-finish', sessionID: sessionId }
+                    }
+                },
+                {
+                    type: 'message.updated',
+                    properties: { info: { sessionID: sessionId, finish: 'stop' } }
+                }
+            ];
+            return {
+                stream: (async function* () {
+                    for (const event of mockEvents) yield event;
+                })()
+            };
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Read src/app.js' }],
+                tools: readToolRequest,
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+
+        const toolCallDeltas = [];
+        let finishReason = null;
+        for (const line of res.text.split('\n')) {
+            if (!line.startsWith('data:') || line.includes('[DONE]')) continue;
+            const json = JSON.parse(line.slice(5).trim());
+            const choice = json.choices?.[0];
+            if (choice?.delta?.tool_calls) toolCallDeltas.push(...choice.delta.tool_calls);
+            if (choice?.finish_reason) finishReason = choice.finish_reason;
+        }
+
+        expect(finishReason).toEqual('tool_calls');
+        expect(toolCallDeltas).toEqual([
+            {
+                index: 0,
+                id: 'call_native_read_1',
+                type: 'function',
+                function: {
+                    name: 'read',
+                    arguments: JSON.stringify({ path: 'src/app.js' })
+                }
+            }
+        ]);
+        // The upstream turn is aborted once the rejection lands, so OpenCode's
+        // follow-up narration about the missing tool is never streamed.
+        expect(res.text).not.toContain('unavailable');
+        expect(sdkMocks.sessionAbort).toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
     });
 
     test('POST /v1/chat/completions parses <function=name>/<parameter=key> tool markup and normalizes the tool name', async () => {

@@ -130,6 +130,26 @@ Great, now answer the original request using the tool result.
 | `high` | `high` |
 | `xhigh` | `high` |
 
+## 🖥️ WebUI Management API
+
+The endpoints behind the WebUI. All of them require `Authorization: Bearer <key>`. The static page assets (`/`, `/index.html`, `/app.js`, `/style.css`) are public so the browser can render and prompt for a key.
+
+| Method | Path | Description |
+|:-----|:-----|:-----|
+| `GET` | `/api/status` | Version, listen addresses (local + LAN), auth state, backend health |
+| `GET` | `/api/config` | Editable field schema plus stored values |
+| `POST` | `/api/config` | Patch config, body `{"values": {...}}`; returns `changed` and `restartRequired` |
+| `GET` | `/api/keys` | List keys (never returns raw values) |
+| `POST` | `/api/keys` | Create a key, body `{"name": "..."}`; `201` with the plaintext key, shown once |
+| `POST` | `/api/keys/migrate` | Move the legacy `config.json` `API_KEY` into `secrets.json` and drop it from the file |
+| `POST` | `/api/keys/:id/revoke` | Revoke immediately; the key stops authenticating right away |
+| `DELETE` | `/api/keys/:id` | Delete the key record |
+| `GET` | `/api/logs?lines=200` | Tail `logs/proxy.log` |
+| `GET` | `/api/stats` | In-memory request / completion counters |
+| `POST` | `/api/stats/reset` | Reset those counters |
+
+Only `DEBUG` and key changes apply without a restart. Every other `POST /api/config` value is written to `config.json` and echoed back under `restartRequired`.
+
 ## ⚠️ Error Responses
 
 ### 401 Unauthorized

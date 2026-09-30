@@ -130,6 +130,26 @@ Great, now answer the original request using the tool result.
 | `high` | `high` |
 | `xhigh` | `high` |
 
+## 🖥️ WebUI 管理接口
+
+WebUI 页面背后的接口，全部需要 `Authorization: Bearer <key>`。静态页面资源（`/`、`/index.html`、`/app.js`、`/style.css`）公开可访问，浏览器加载页面并提示输入密钥。
+
+| 方法 | 路径 | 说明 |
+|:-----|:-----|:-----|
+| `GET` | `/api/status` | 版本、监听地址（本机 + 局域网）、鉴权状态、后端健康 |
+| `GET` | `/api/config` | 可编辑字段结构与当前取值 |
+| `POST` | `/api/config` | 修改配置，body 为 `{"values": {...}}`；返回 `changed` 与 `restartRequired` |
+| `GET` | `/api/keys` | 密钥列表（永不返回明文） |
+| `POST` | `/api/keys` | 创建密钥，body 为 `{"name": "..."}`；`201` 返回明文，仅此一次可见 |
+| `POST` | `/api/keys/migrate` | 把旧的 `config.json` `API_KEY` 迁入 `secrets.json` 并从文件中移除 |
+| `POST` | `/api/keys/:id/revoke` | 立即撤销，该密钥马上失效 |
+| `DELETE` | `/api/keys/:id` | 删除密钥记录 |
+| `GET` | `/api/logs?lines=200` | 尾随 `logs/proxy.log` |
+| `GET` | `/api/stats` | 内存中的请求 / 完成计数 |
+| `POST` | `/api/stats/reset` | 重置上述计数 |
+
+只有 `DEBUG` 与密钥改动无需重启；其余 `POST /api/config` 的取值会写入 `config.json`，并回显在 `restartRequired` 中。
+
 ## ⚠️ 错误响应
 
 ### 401 Unauthorized

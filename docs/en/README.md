@@ -9,7 +9,7 @@ English docs. For the English intro see [README.en.md](../../README.en.md). For 
 | 📖 [Getting Started](./getting-started.md) | Quick start guide |
 | ⚙️ [Configuration](./configuration.md) | Configuration options |
 | 🔌 [API Reference](./api-reference.md) | API reference |
-| 🐳 [Docker Deployment](./docker.md) | Docker deploy guide |
+| 🖥️ [WebUI](../../README.en.md#-webui) | Dashboard, chat debug, config and key management |
 | 🔧 [Troubleshooting](./troubleshooting.md) | FAQ and fixes |
 | 💻 [Development](./development.md) | Development guide |
 

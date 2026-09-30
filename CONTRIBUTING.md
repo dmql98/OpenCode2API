@@ -63,25 +63,33 @@ docs: update configuration documentation
 
 ## Development Setup
 
+Requires Node.js 18 or newer.
+
 ```bash
 # Clone and install
 git clone https://github.com/TiaraBasori/opencode2api.git
 cd opencode2api
 npm install
 
+# Configure
+cp config.json.example config.json
+
 # Run tests
 npm test
 
-# Start locally
-npm start
+# Start locally (backend + gateway, logs in logs/)
+node start.mjs start
+node start.mjs stop
 ```
+
+`config.json` and `secrets.json` are gitignored — never commit them. The WebUI lives in `public/` as plain HTML/CSS/JS with no build step, so there is nothing to compile before testing UI changes.
 
 ## Testing
 
-- Unit tests (`tests/unit/`): `npm run test:unit`
-- Integration tests (Docker, `tests/integration/`): `npm run test:integration`
+- All unit tests (Jest 30, `tests/unit/`): `npm test` or `npm run test:unit`
 - Live streaming smoke test (manual, `tests/manual/`): `npm run test:stream`
-- All unit tests: `npm test`
+- The test scripts already set `NODE_OPTIONS=--experimental-vm-modules`; no extra setup is needed
+- Tests must pass (`npm test`) before a PR can be merged
 
 ## Code Review Process
 

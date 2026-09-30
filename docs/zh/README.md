@@ -1,6 +1,6 @@
 # OpenCode2API 文档中心
 
-简体中文文档。英文文档见 [English](./en/README.md)，英文介绍见 [README.en.md](../../README.en.md)。
+简体中文文档。英文文档见 [English](../en/README.md)，英文介绍见 [README.en.md](../../README.en.md)。
 
 ## 📚 目录
 
@@ -9,7 +9,7 @@
 | 📖 [快速开始](./getting-started.md) | 快速开始指南 |
 | ⚙️ [配置详解](./configuration.md) | 配置选项详解 |
 | 🔌 [API 参考](./api-reference.md) | API 接口文档 |
-| 🐳 [Docker 部署](./docker.md) | Docker 部署指南 |
+| 🖥️ [WebUI](../../README.md#️-webui) | 控制台、聊天调试、配置与密钥管理 |
 | 🔧 [故障排查](./troubleshooting.md) | 常见问题排查 |
 | 💻 [开发指南](./development.md) | 开发指南 |
 

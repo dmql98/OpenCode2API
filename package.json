@@ -1,23 +1,23 @@
 {
   "name": "opencode2api",
-  "version": "2.0.0",
-  "description": "An OpenAI-compatible API gateway for OpenCode Zen free models.",
+  "version": "3.0.0",
+  "description": "Local / LAN OpenAI-compatible gateway for OpenCode, with a built-in WebUI console.",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest tests/unit --runInBand --detectOpenHandles",
     "test:unit": "NODE_OPTIONS=--experimental-vm-modules jest tests/unit --runInBand --detectOpenHandles",
-    "test:integration": "bash tests/integration/test-integration.sh",
     "test:stream": "bash tests/manual/test-streaming-real.sh"
   },
   "keywords": [
     "opencode",
     "openai",
+    "gateway",
     "proxy",
-    "kimi",
-    "glm",
-    "minimax",
+    "webui",
+    "lan",
+    "local",
     "ai",
     "api"
   ],
@@ -28,7 +28,6 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.1.51",
-    "axios": "^1.7.9",
     "body-parser": "^1.20.3",
     "cors": "^2.8.5",
     "express": "^4.21.2"

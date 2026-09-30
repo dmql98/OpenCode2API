@@ -1,22 +1,90 @@
-# ⚙️ Configuration
+# Configuration
 
 Priority: **env vars > config.json > defaults**.
 
 Env vars use the `OPENCODE_` prefix; config.json uses the short names (see tables).
 
-## 🔧 Environment Variables
+## Files
+
+| File | Tracked | Purpose |
+|:-----|:--------|:--------|
+| `config.json` | no (gitignored) | General configuration, 4-space indented JSON |
+| `secrets.json` | no (gitignored) | API keys, created on demand, 4-space indented JSON |
+| `config.json.example` | yes | Sample `config.json`, 2-space indented |
+
+Copy `config.json.example` to `config.json` once after cloning. `secrets.json` is created automatically the first time a key is added from the WebUI — there is no need to create it by hand.
+
+## WebUI Config Editor
+
+Open the **Config** tab to edit the fields below. Every save is written to `config.json`; the API response reports `restartRequired` with the fields that still need a restart (`node start.mjs stop` then `node start.mjs start`, or restart the `start.bat` window).
+
+| Field | Type | Default | Applies |
+|:------|:-----|:--------|:--------|
+| `PORT` | number (1–65535) | `10000` | restart |
+| `BIND_HOST` | string | `0.0.0.0` | restart |
+| `OPENCODE_SERVER_URL` | string | `http://127.0.0.1:10001` | restart |
+| `OPENCODE_SERVER_PASSWORD` | string | (empty) | restart |
+| `REQUEST_TIMEOUT_MS` | number (>= 1000) | `180000` | restart |
+| `DEBUG` | boolean | `false` | **hot** |
+| `DISABLE_TOOLS` | boolean | `true` | restart |
+| `PROMPT_MODE` | `standard` \| `plugin-inject` | `standard` | restart |
+| `OMIT_SYSTEM_PROMPT` | boolean | `false` | restart |
+| `AUTO_CLEANUP_CONVERSATIONS` | boolean | `false` | restart |
+| `CLEANUP_INTERVAL_MS` | number (>= 1000) | `43200000` | restart |
+| `CLEANUP_MAX_AGE_MS` | number (>= 1000) | `86400000` | restart |
+| `HEALTH_DETAILS_ENABLED` | boolean | `true` | restart |
+| `HEALTH_DETAILS_REQUIRE_AUTH` | boolean | `true` | restart |
+| `METRICS_ENABLED` | boolean | `false` | restart |
+| `METRICS_REQUIRE_AUTH` | boolean | `true` | restart |
+
+Only `DEBUG` is hot. API keys are hot too: create, revoke, delete and migrate take effect immediately, with no restart.
+
+Fields that are not in this table (tool control, diagnostics flags, `OPENCODE_PATH`, `MANAGE_BACKEND`, `ZEN_API_KEY`, and so on) can still be set through `config.json` or env vars, but are not editable from the WebUI.
+
+## API Keys
+
+Keys are managed in the **Keys** tab and stored in `secrets.json`. Several keys can be active at once; each request must present one of them as `Authorization: Bearer <key>` on every `/v1/*` and `/api/*` route. Static WebUI assets stay public so the page can render and prompt for a key.
+
+- **Create** — generates an `oc_sk_...` key and shows it once; stored as-is in `secrets.json`.
+- **Revoke** — marks the key as revoked; it stops working immediately but stays listed.
+- **Delete** — removes the key from `secrets.json` entirely.
+- **Migrate** — moves the legacy `API_KEY` from `config.json` into `secrets.json` (`POST /api/keys/migrate`) and removes it from `config.json`. Afterwards it behaves like any other managed key and can be revoked.
+
+The legacy `API_KEY` field in `config.json` remains accepted as a read-only key, so existing setups keep working until you migrate it.
+
+If no active key exists anywhere, the gateway runs in open mode and requires no auth.
+
+### WebUI API
+
+All `/api/*` routes require a Bearer key:
+
+| Route | Purpose |
+|:------|:--------|
+| `GET /api/status` | Version, uptime, listen endpoints, backend health, auth and stats summary |
+| `GET /api/config` | Editable field schema plus stored values |
+| `POST /api/config` | Apply a patch; returns `changed` and `restartRequired` |
+| `GET /api/keys` | List keys (masked), including the read-only legacy key |
+| `POST /api/keys` | Create a key (returns the plain value once) |
+| `POST /api/keys/migrate` | Move the legacy `config.json` key into `secrets.json` |
+| `POST /api/keys/:id/revoke` | Revoke a key |
+| `DELETE /api/keys/:id` | Delete a key |
+| `GET /api/logs?lines=200` | Tail `logs/proxy.log` (10–2000 lines) |
+| `GET /api/stats` | In-memory request / completion counters |
+| `POST /api/stats/reset` | Reset those counters |
+
+## Environment Variables
 
 ### Service & Auth
 
 | Env var | config.json | Default | Description |
 |:---------|:------------|:-------|:-----|
 | `OPENCODE_PROXY_PORT` / `PORT` | `PORT` | `10000` | Proxy listen port |
-| `BIND_HOST` | `BIND_HOST` | `0.0.0.0` | Listen address |
+| `BIND_HOST` | `BIND_HOST` | `0.0.0.0` | Listen address, `0.0.0.0` = reachable from the LAN |
 | `OPENCODE_SERVER_PORT` | - | `10001` | Backend port, only used to build default `OPENCODE_SERVER_URL` |
 | `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode backend address |
 | `OPENCODE_SERVER_PASSWORD` | `OPENCODE_SERVER_PASSWORD` | (empty) | Backend auth password |
-| `API_KEY` | `API_KEY` | (empty) | Proxy Bearer key, no auth when unset |
-| `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `false` | Proxy starts and manages the OpenCode backend process (managed by entrypoint in Docker, no need to enable) |
+| `API_KEY` | `API_KEY` | (empty) | Legacy read-only Bearer key; no auth at all when no key is configured |
+| `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `false` | Gateway starts and manages the OpenCode backend process |
 | `OPENCODE_PATH` | `OPENCODE_PATH` | `opencode` | OpenCode binary path |
 | `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (empty) | Zen API key passthrough |
 | `OPENCODE_USE_ISOLATED_HOME` | `USE_ISOLATED_HOME` | `false` | Use an isolated OpenCode config directory |
@@ -56,7 +124,7 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 | `OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS` | - | `30000` | First-delta timeout for streaming |
 | `OPENCODE2API_EVENT_IDLE_TIMEOUT_MS` | - | `8000` | Idle timeout for streaming |
 
-## 📄 config.json Example
+## config.json Example
 
 ```json
 {
@@ -66,22 +134,20 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
     "DISABLE_TOOLS": true,
     "EXTERNAL_TOOLS_MODE": "proxy-bridge",
     "EXTERNAL_TOOLS_CONFLICT_POLICY": "namespace",
-    "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
-    "INTERNAL_TOOL_METRICS_ENABLED": true,
     "USE_ISOLATED_HOME": false,
     "PROMPT_MODE": "standard",
     "OMIT_SYSTEM_PROMPT": false,
     "AUTO_CLEANUP_CONVERSATIONS": false,
     "CLEANUP_INTERVAL_MS": 43200000,
     "CLEANUP_MAX_AGE_MS": 86400000,
-    "REQUEST_TIMEOUT_MS": 180000,
     "DEBUG": false,
     "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
-    "OPENCODE_PATH": "opencode"
+    "OPENCODE_PATH": "opencode",
+    "REQUEST_TIMEOUT_MS": 180000
 }
 ```
 
-## 🛠️ Tool Control Details
+## Tool Control Details
 
 ### External Tool Bridge
 
@@ -112,9 +178,9 @@ When a request has no `tools`, `opencode.internal_allowed_tools` in the request 
 }
 ```
 
-## 📊 Health Diagnostics & Metrics
+## Health Diagnostics & Metrics
 
-- `/health` is always a lightweight check.
+- `/health` is always a lightweight check and needs no auth.
 - `/health/details` returns structured diagnostic JSON (`404` when `OPENCODE_HEALTH_DETAILS_ENABLED=false`, auth required when `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH=true`):
 
 ```json
@@ -154,30 +220,36 @@ opencode_internal_tool_fallback_disabled_total
 opencode_internal_tool_cache_ids
 ```
 
-## 🎯 Prompt Mode
+## Prompt Mode
 
 | Mode | Description |
 |:-----|:-----|
 | `standard` (default) | Standard mode, full prompt handling |
 | `plugin-inject` | Plugin-inject mode, smaller model-side prompt, usually used with `OMIT_SYSTEM_PROMPT=true` |
 
-## ⭐ Recommended Configs
+## Recommended Configs
 
-### Docker Production
+### LAN Gateway
 
-```env
-API_KEY=your-secret-key
-OPENCODE_SERVER_PASSWORD=your-password
-OPENCODE_DISABLE_TOOLS=true
-OPENCODE_INTERNAL_ALLOWED_TOOLS=web_fetch
-OPENCODE_PROXY_PROMPT_MODE=plugin-inject
-OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
-OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
+```json
+{
+    "PORT": 10000,
+    "BIND_HOST": "0.0.0.0",
+    "DISABLE_TOOLS": true,
+    "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
+    "PROMPT_MODE": "plugin-inject",
+    "OMIT_SYSTEM_PROMPT": true,
+    "AUTO_CLEANUP_CONVERSATIONS": true
+}
 ```
+
+Set `OPENCODE_SERVER_PASSWORD` to match your backend, then create API keys from the WebUI **Keys** tab. Because the gateway binds to `0.0.0.0`, use keys — without them it runs open to anyone on the network.
 
 ### Local Development
 
-```env
-OPENCODE_DISABLE_TOOLS=false
-OPENCODE_PROXY_DEBUG=true
+```json
+{
+    "DISABLE_TOOLS": false,
+    "DEBUG": true
+}
 ```

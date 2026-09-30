@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-09-30
+
+### Added
+
+- **WebUI Console**: A built-in web console served by the gateway itself at `/` (native HTML/CSS/JS in `public/`, zero build step) with four tabs — 控制台 (status, endpoints, backend health, log tail), 聊天调试 (streaming SSE chat against `/v1/chat/completions`), 配置 (every editable config field, each labelled 热更新 or 重启生效), and 密钥 (create / revoke / delete API keys).
+- **Secrets-based Key Management**: API keys are now stored in `secrets.json` (gitignored) and managed from the WebUI; multiple keys can be active at once, the legacy `API_KEY` in `config.json` remains accepted as a read-only key and can be migrated in one click (`POST /api/keys/migrate`, after which it is removed from `config.json`), and key operations take effect immediately without a restart. With no key configured anywhere the gateway still runs open, as before.
+- **LAN Access**: `BIND_HOST` defaults to `0.0.0.0`; on startup the gateway prints the local and LAN URLs for both the gateway and the WebUI, and `/api/status` reports them under `listen.endpoints`.
+- **Stats and Log Tail**: In-memory request/completion counters shown on the dashboard (`GET /api/stats`, `POST /api/stats/reset`) and log tailing of `logs/proxy.log` (`GET /api/logs?lines=200`).
+- **WebUI API**: `GET /api/status`, `GET|POST /api/config`, `GET|POST /api/keys`, `POST /api/keys/migrate`, `POST /api/keys/:id/revoke`, `DELETE /api/keys/:id`, `GET /api/logs`, `GET /api/stats`, `POST /api/stats/reset` — all Bearer-authenticated, while the static WebUI assets stay public so the page can render and prompt for a key.
+
+### Changed
+
+- **BREAKING — Docker Support Removed**: Docker is no longer a supported deployment. `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `entrypoint.sh`, `.github/workflows/docker-publish.yml`, `docs/zh/docker.md`, `docs/en/docker.md`, `tests/integration/test-integration.sh`, `.env` and `.env.example` were deleted, the `test:integration` script was dropped, and the docs now cover `node start.mjs start` / `start.bat` only. Docker users must migrate to running the gateway directly on Node.js 18+.
+- **Configuration Files**: `config.json` (general config) and `secrets.json` (API keys) are the two gitignored JSON files the gateway reads and writes; `config.json.example` stays tracked as the sample. Only `DEBUG` and API keys hot-reload — every other config change is written to `config.json` and requires a restart, and the config API returns `restartRequired` accordingly.
+- **Dependencies**: Removed `axios`; the package version is now `3.0.0`.
+
 ## [2.0.0] - 2026-09-25
 
 ### Added

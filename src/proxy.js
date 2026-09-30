@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
+import { EXTERNAL_TOOL_PREFIX } from './tool-runtime/contracts.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
@@ -19,6 +20,9 @@ import {
     createToolCallFilter,
     createExternalToolCallStreamParser
 } from './tool-runtime/parser.js';
+import { isAuthorized, lanEndpoints } from './config.js';
+import { mountWebui, createWebuiRouter } from './webui.js';
+import { recordRequest, recordCompletion } from './stats.js';
 
 /**
  * Detect transient upstream provider failures that succeed on retry.
@@ -529,11 +533,9 @@ if (process.platform !== 'win32') {
  */
 export function createApp(config) {
     const {
-        API_KEY,
         OPENCODE_SERVER_URL,
         OPENCODE_SERVER_PASSWORD,
         REQUEST_TIMEOUT_MS,
-        DEBUG,
         DISABLE_TOOLS,
         INTERNAL_WEB_FETCH_ENABLED,
         INTERNAL_ALLOWED_TOOLS = [],
@@ -554,9 +556,13 @@ export function createApp(config) {
     const app = express();
     app.use(cors({
         origin: '*',
-        methods: ['GET', 'POST', 'OPTIONS'],
+        methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
         allowedHeaders: ['Content-Type', 'Authorization']
     }));
+
+    // WebUI assets are public: the page has to load before it can ask for a key.
+    mountWebui(app);
+
     app.use(bodyParser.json({ limit: '50mb' }));
     app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
@@ -573,17 +579,51 @@ export function createApp(config) {
         return false;
     };
 
-    // Auth middleware
+    const PUBLIC_PATHS = new Set([
+        '/',
+        '/index.html',
+        '/favicon.ico',
+        '/health',
+        '/health/details',
+        '/metrics'
+    ]);
+
+    // Auth middleware. Keys live in secrets.json (managed from the WebUI) with the
+    // legacy config.json API_KEY kept as a read-only entry; `config.API_KEY` and the
+    // key list are read per request so the UI can add or revoke without a restart.
     app.use((req, res, next) => {
-        if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
-        if (API_KEY && API_KEY.trim() !== '') {
-            const authHeader = req.headers.authorization;
-            if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
-                return res.status(401).json({ error: { message: 'Unauthorized' } });
-            }
+        if (req.method === 'OPTIONS' || PUBLIC_PATHS.has(req.path)) return next();
+        const auth = isAuthorized(req.headers.authorization, config.API_KEY);
+        if (!auth.ok) {
+            recordRequest({ path: req.path, status: 401, durationMs: 0 });
+            return res.status(401).json({ error: { message: 'Unauthorized' } });
         }
         next();
     });
+
+    // Request accounting for the WebUI dashboard, after auth so static assets and
+    // rejected requests do not inflate the API counters. The path is captured up
+    // front: mounted routers rewrite req.url, and finish fires while it is stripped.
+    app.use((req, res, next) => {
+        const startedAt = Date.now();
+        const pathname = req.path;
+        res.on('finish', () => {
+            recordRequest({
+                path: pathname,
+                status: res.statusCode,
+                durationMs: Date.now() - startedAt
+            });
+        });
+        next();
+    });
+
+    const backendHealth = async () => {
+        const startedAt = Date.now();
+        await checkHealth(OPENCODE_SERVER_URL, OPENCODE_SERVER_PASSWORD);
+        return { reachable: true, latencyMs: Date.now() - startedAt };
+    };
+
+    app.use('/api', createWebuiRouter({ config, backendHealth }));
 
     const getProvidersList = async () => {
         const providersRes = await client.config.providers();
@@ -668,7 +708,7 @@ export function createApp(config) {
     });
 
     const logDebug = (...args) => {
-        if (DEBUG) {
+        if (config.DEBUG) {
             console.log('[Proxy][Debug]', ...args);
         }
     };
@@ -1015,6 +1055,22 @@ export function createApp(config) {
         }));
     };
 
+    // Calls recovered from OpenCode's native channel are keyed by the namespaced name the
+    // backend saw (`external__read`), but clients only know the names they declared
+    // (`read`). Map back before validating and returning, matching what the text-channel
+    // parser already does.
+    const restoreOriginalToolNames = (toolCalls, registry) => {
+        if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+        return toolCalls.map((toolCall) => {
+            const tool = findExternalToolByName(registry, toolCall?.function?.name);
+            if (!tool?.originalName || tool.originalName === toolCall.function.name) return toolCall;
+            return {
+                ...toolCall,
+                function: { ...toolCall.function, name: tool.originalName }
+            };
+        });
+    };
+
     const createForcedToolCallRequester = ({
         mode,
         sessionId,
@@ -1024,7 +1080,9 @@ export function createApp(config) {
         modelID,
         toolOverrides,
         requestTimeoutMs,
-        forbidThinkBlock = false
+        forbidThinkBlock = false,
+        since = 0,
+        recoverNativeCalls = false
     }) => async () => {
         if (mode !== 'required') return null;
         if (!requiredTool) return null;
@@ -1043,7 +1101,10 @@ export function createApp(config) {
             forcedPromptParams.body.tools = toolOverrides;
         }
         await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
-        return pollForAssistantResponse(sessionId, requestTimeoutMs);
+        return pollForAssistantResponse(sessionId, requestTimeoutMs, DEFAULT_POLL_INTERVAL_MS, {
+            since,
+            recoverNativeCalls
+        });
     };
 
     const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
@@ -1060,7 +1121,7 @@ export function createApp(config) {
     };
 
     const logInternalToolEvent = (event, details = {}) => {
-        if (!DEBUG && !INTERNAL_TOOL_METRICS_ENABLED) return;
+        if (!config.DEBUG && !INTERNAL_TOOL_METRICS_ENABLED) return;
         const payload = {
             event,
             ...details
@@ -1282,7 +1343,100 @@ export function createApp(config) {
         return { content, reasoning, toolParts };
     }
 
-    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS) {
+    // OpenCode only executes the tools registered in its own config. The external tools
+    // this gateway exposes to clients are advertised through the prompt instead, so when
+    // the model calls one through OpenCode's *native* tool channel, OpenCode rejects it
+    // with `NoSuchToolError` — even though it parsed the arguments fine, as the `input`
+    // on the rejected part shows. Recover those calls so the client still receives them
+    // as ordinary tool_calls instead of a failed turn.
+    const toNativeExternalCall = (part) => {
+        if (!part || part.type !== 'tool') return null;
+        const name = typeof part.tool === 'string' ? part.tool : '';
+        if (!name.startsWith(EXTERNAL_TOOL_PREFIX)) return null;
+        if (part.state?.status !== 'error') return null;
+        const id = part.callID || part.id;
+        if (!id) return null;
+        const input = part.state?.input;
+        return {
+            id,
+            function: {
+                name,
+                arguments: typeof input === 'string' ? input : JSON.stringify(input ?? {})
+            }
+        };
+    };
+
+    // Polling reads a finished transcript, so the rejection has to be scraped out of it.
+    // Everything the assistant said *after* the rejected call is fallout from OpenCode
+    // feeding the error back to the model ("the tool is unavailable"), so the content is
+    // cut at the call and later messages are ignored — the client must not see that
+    // narration next to the tool_calls it is about to execute.
+    const scanNativeExternalCalls = (messages, since = 0) => {
+        const calls = [];
+        const seen = new Set();
+        const contentChunks = [];
+        const reasoningChunks = [];
+        let hitNativeCall = false;
+        if (!Array.isArray(messages)) return { calls, content: '', reasoning: '' };
+        for (const entry of messages) {
+            const info = entry?.info;
+            if (info?.role !== 'assistant') continue;
+            const created = info.time?.created;
+            if (since && typeof created === 'number' && created < since) continue;
+            for (const part of (entry.parts || [])) {
+                const nativeCall = toNativeExternalCall(part);
+                if (nativeCall) {
+                    if (!seen.has(nativeCall.id)) {
+                        seen.add(nativeCall.id);
+                        calls.push(nativeCall);
+                        hitNativeCall = true;
+                    }
+                    continue;
+                }
+                if (hitNativeCall) continue;
+                if (part.type === 'text') contentChunks.push(part.text || '');
+                else if (part.type === 'reasoning') reasoningChunks.push(part.text || '');
+            }
+        }
+        return {
+            calls,
+            content: contentChunks.join(''),
+            reasoning: reasoningChunks.join('')
+        };
+    };
+
+    // `since` bounds the scan to messages created for the current turn, and
+    // `recoverNativeCalls` opts into that scan at all. Both default to "off" so callers
+    // that never see rejected native calls (e.g. the Responses endpoint, whose sessions
+    // are single-use) keep their original behaviour untouched.
+    const isCurrentTurnMessage = (info, since = 0) => {
+        if (!since) return true;
+        const created = info?.time?.created;
+        if (typeof created !== 'number') return true;
+        return created >= since;
+    };
+
+    const countPendingExternalParts = (messages, since = 0) => {
+        let pending = 0;
+        if (!Array.isArray(messages)) return pending;
+        for (const entry of messages) {
+            if (entry?.info?.role !== 'assistant') continue;
+            if (!isCurrentTurnMessage(entry.info, since)) continue;
+            for (const part of (entry.parts || [])) {
+                const nativeCall = toNativeExternalCall(part);
+                if (nativeCall) continue;
+                if (part.type !== 'tool') continue;
+                if (typeof part.tool !== 'string' || !part.tool.startsWith(EXTERNAL_TOOL_PREFIX)) continue;
+                const status = part.state?.status;
+                if (status === 'pending' || status === 'running') pending += 1;
+            }
+        }
+        return pending;
+    };
+
+    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS, options = {}) {
+        const since = options.since || 0;
+        const recoverNativeCalls = Boolean(options.recoverNativeCalls);
         const pollStart = Date.now();
         const startedAt = Date.now();
         // Best-effort snapshot of the most recent in-flight assistant message. Polling
@@ -1291,53 +1445,90 @@ export function createApp(config) {
         // truncates the answer to the reasoning alone. Keep the partial around purely as
         // a timeout fallback and otherwise wait for the message to actually finish.
         let lastPartial = null;
+        let recoveredNative = null;
         while (Date.now() - startedAt < timeoutMs) {
             const messagesRes = await client.session.messages({ path: { id: sessionId } });
             const messages = messagesRes?.data || messagesRes || [];
             if (Array.isArray(messages) && messages.length) {
-                for (let i = messages.length - 1; i >= 0; i -= 1) {
-                    const entry = messages[i];
-                    const info = entry?.info;
-                    if (info?.role !== 'assistant') continue;
-                    const { content, reasoning, toolParts } = extractFromParts(entry?.parts || []);
-                    const error = info?.error || null;
-                    // finish === 'tool' marks an intermediate turn that pauses for a tool
-                    // result; the assistant is not done producing output yet.
-                    const finished = info.finish && info.finish !== 'tool';
-                    const done = Boolean(finished || info.time?.completed || error);
-                    if (toolParts.length > 0) {
-                        logDebug('Polling found tool parts', {
-                            sessionId,
-                            count: toolParts.length,
-                            parts: toolParts.map(p => ({
-                                id: p.id,
-                                tool: p.tool,
-                                status: p.state?.status,
-                                input: p.state?.input
-                            }))
-                        });
-                    }
-                    if (done) {
-                        if (error) {
-                            console.error('[Proxy] OpenCode assistant error:', error);
-                        }
-                        logDebug('Polling completed', {
+                const nativeRecovery = recoverNativeCalls
+                    ? scanNativeExternalCalls(messages, since)
+                    : { calls: [], content: '', reasoning: '' };
+                if (nativeRecovery.calls.length > 0) {
+                    recoveredNative = nativeRecovery;
+                    // Parallel calls from one model response settle a few polls apart;
+                    // wait for them so the client gets the whole batch.
+                    if (countPendingExternalParts(messages, since) === 0) {
+                        logDebug('Polling recovered native external tool calls', {
                             sessionId,
                             ms: Date.now() - pollStart,
-                            done,
-                            contentLen: content.length,
-                            reasoningLen: reasoning.length,
-                            error: error ? error.name : null
+                            calls: nativeRecovery.calls.map(c => c.function.name)
                         });
-                        return { content, reasoning, error };
+                        return {
+                            content: nativeRecovery.content,
+                            reasoning: nativeRecovery.reasoning,
+                            nativeExternalCalls: nativeRecovery.calls
+                        };
                     }
-                    if (content || reasoning) {
-                        lastPartial = { content, reasoning, error: null };
+                } else {
+                    for (let i = messages.length - 1; i >= 0; i -= 1) {
+                        const entry = messages[i];
+                        const info = entry?.info;
+                        if (info?.role !== 'assistant') continue;
+                        const { content, reasoning, toolParts } = extractFromParts(entry?.parts || []);
+                        const error = info?.error || null;
+                        // finish === 'tool' marks an intermediate turn that pauses for a tool
+                        // result; the assistant is not done producing output yet.
+                        const finished = info.finish && info.finish !== 'tool';
+                        const done = Boolean(finished || info.time?.completed || error);
+                        if (toolParts.length > 0) {
+                            logDebug('Polling found tool parts', {
+                                sessionId,
+                                count: toolParts.length,
+                                parts: toolParts.map(p => ({
+                                    id: p.id,
+                                    tool: p.tool,
+                                    status: p.state?.status,
+                                    input: p.state?.input
+                                }))
+                            });
+                        }
+                        if (done) {
+                            if (error) {
+                                console.error('[Proxy] OpenCode assistant error:', error);
+                            }
+                            logDebug('Polling completed', {
+                                sessionId,
+                                ms: Date.now() - pollStart,
+                                done,
+                                contentLen: content.length,
+                                reasoningLen: reasoning.length,
+                                error: error ? error.name : null
+                            });
+                            return { content, reasoning, error };
+                        }
+                        if (content || reasoning) {
+                            lastPartial = { content, reasoning, error: null };
+                        }
+                        break;
                     }
-                    break;
                 }
             }
             await sleep(intervalMs);
+        }
+        // A rejected native call is a valid answer even if the transcript never settled
+        // (the parallel sibling is still marked pending). Hand back what was recovered
+        // rather than timing out on a turn that already produced its tool calls.
+        if (recoveredNative) {
+            logDebug('Polling timeout with recovered native tool calls', {
+                sessionId,
+                ms: Date.now() - pollStart,
+                calls: recoveredNative.calls.map(c => c.function.name)
+            });
+            return {
+                content: recoveredNative.content,
+                reasoning: recoveredNative.reasoning,
+                nativeExternalCalls: recoveredNative.calls
+            };
         }
         if (lastPartial) {
             logDebug('Polling timeout with partial response', {
@@ -1352,7 +1543,9 @@ export function createApp(config) {
         throw new Error(`Request timeout after ${timeoutMs}ms`);
     }
 
-    async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
+    async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs, options = {}) {
+        const turnStartedAt = options.turnStartedAt || 0;
+        const recoverNativeCalls = Boolean(options.recoverNativeCalls);
         const controller = new AbortController();
         const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
         const eventStream = eventStreamResult.stream;
@@ -1368,6 +1561,11 @@ export function createApp(config) {
         // truncated streaming responses that relied on internal tool execution.
         const activeToolCallIds = new Set();
         const startedAt = Date.now();
+        // Rejected calls to this gateway's own tools, recovered while streaming (see
+        // toNativeExternalCall). Kept here rather than in the request scope so the
+        // collector can hand them back with the text it already streamed.
+        const nativeExternalCalls = [];
+        const nativeExternalCallKeys = new Set();
 
         const finishPromise = new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
@@ -1419,6 +1617,78 @@ export function createApp(config) {
                         receivedDelta
                     });
                 }, idleTimeoutMs);
+            };
+
+            const NATIVE_CALL_BATCH_MS = 400;
+            const NATIVE_ABORT_TIMEOUT_MS = 3000;
+            let nativeBatchTimer = null;
+
+            const clearTurnTimers = () => {
+                clearTimeout(timeoutId);
+                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                if (idleTimer) clearTimeout(idleTimer);
+                if (nativeBatchTimer) clearTimeout(nativeBatchTimer);
+                nativeBatchTimer = null;
+            };
+
+            const abortUpstreamSession = async () => {
+                let abortTimer = null;
+                try {
+                    await Promise.race([
+                        client.session.abort({ path: { id: sessionId } }),
+                        new Promise((r) => {
+                            abortTimer = setTimeout(r, NATIVE_ABORT_TIMEOUT_MS);
+                            if (abortTimer.unref) abortTimer.unref();
+                        })
+                    ]);
+                } catch (e) {
+                    logDebug('Failed to abort upstream session', { sessionId, error: e.message });
+                } finally {
+                    clearTimeout(abortTimer);
+                }
+            };
+
+            const finalizeNativeExternalCalls = async () => {
+                if (finished || nativeExternalCalls.length === 0) return;
+                finished = true;
+                clearTurnTimers();
+                logDebug('Recovered native external tool calls from stream', {
+                    sessionId,
+                    ms: Date.now() - startedAt,
+                    calls: nativeExternalCalls.map(c => c.function.name)
+                });
+                // OpenCode feeds the rejection straight back to the model, which then
+                // writes "the tool is unavailable" into the transcript and streams that
+                // to the client. Cut the turn here instead: the client is about to run
+                // the call itself and must not see the false report.
+                await abortUpstreamSession();
+                resolve({ content, reasoning, nativeExternalCalls: [...nativeExternalCalls] });
+            };
+
+            const handleNativeCallPart = (part) => {
+                if (!recoverNativeCalls) return;
+                const nativeCall = toNativeExternalCall(part);
+                if (!nativeCall || nativeExternalCallKeys.has(nativeCall.id)) return;
+                nativeExternalCallKeys.add(nativeCall.id);
+                nativeExternalCalls.push(nativeCall);
+                if (nativeBatchTimer) return;
+                // Sibling calls from one model response land within milliseconds; hold
+                // the turn open briefly so the client receives the whole batch.
+                nativeBatchTimer = setTimeout(() => {
+                    nativeBatchTimer = null;
+                    finalizeNativeExternalCalls().catch((e) => logDebug('Native call finalize failed', { error: e.message }));
+                }, NATIVE_CALL_BATCH_MS);
+                if (nativeBatchTimer.unref) nativeBatchTimer.unref();
+            };
+
+            const handleStepFinish = (part) => {
+                if (!part || part.type !== 'step-finish') return;
+                if (finished || !nativeExternalCalls.length) return;
+                if (nativeBatchTimer) {
+                    clearTimeout(nativeBatchTimer);
+                    nativeBatchTimer = null;
+                }
+                finalizeNativeExternalCalls().catch((e) => logDebug('Native call finalize failed', { error: e.message }));
             };
 
             const trackToolActivity = (part) => {
@@ -1476,6 +1746,8 @@ export function createApp(config) {
                             const { part, delta } = event.properties;
                             rememberPartType(part);
                             trackToolActivity(part);
+                            handleNativeCallPart(part);
+                            handleStepFinish(part);
                             // Older OpenCode servers carried the streaming delta directly on
                             // message.part.updated; newer servers emit message.part.delta.
                             if (delta) applyTextDelta(part.type, delta);
@@ -1501,6 +1773,13 @@ export function createApp(config) {
                             // this, the collector waits out the whole first-delta window before
                             // polling rediscovers the same error.
                             if (info.error && !finished) {
+                                // The rejection we recovered is the answer this turn is
+                                // looking for; the message-level error is just fallout
+                                // from the same unresolvable tool call.
+                                if (nativeExternalCalls.length > 0) {
+                                    handleStepFinish({ type: 'step-finish' });
+                                    break;
+                                }
                                 finished = true;
                                 clearTimeout(timeoutId);
                                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -1516,6 +1795,10 @@ export function createApp(config) {
                             // Reconcile active tool calls from the full message snapshot so we
                             // detect pending tools even when only message.updated fires.
                             if (Array.isArray(info.parts)) {
+                                // Snapshots can also arrive for messages left over from an
+                                // earlier turn; only this turn's messages may contribute
+                                // recovered tool calls.
+                                const currentTurn = isCurrentTurnMessage(info, turnStartedAt);
                                 for (const part of info.parts) {
                                     rememberPartType(part);
                                     if (part && part.type === 'tool') {
@@ -1525,6 +1808,7 @@ export function createApp(config) {
                                         } else if (status === 'completed' || status === 'error') {
                                             if (part.id) activeToolCallIds.delete(part.id);
                                         }
+                                        if (currentTurn) handleNativeCallPart(part);
                                     }
                                 }
                             }
@@ -1544,6 +1828,12 @@ export function createApp(config) {
                                         activeTools: activeToolCallIds.size
                                     });
                                     continue;
+                                }
+                                if (nativeExternalCalls.length > 0) {
+                                    // The turn's real result is the recovered call, not the
+                                    // fallout text. Finalize instead of resolving plainly.
+                                    finalizeNativeExternalCalls().catch((e) => logDebug('Native call finalize failed', { error: e.message }));
+                                    break;
                                 }
                                 if (!finished) {
                                     finished = true;
@@ -1602,6 +1892,9 @@ export function createApp(config) {
                 // Declared out here because the finally block runs on a path where the
                 // request body destructuring below may never have executed.
                 let lastForwardedUserText = '';
+                // Marks the start of this turn so recovered tool calls are only ever
+                // taken from messages produced now, never from an earlier turn.
+                const turnStartedAt = Date.now();
 
                 try {
                     const { messages, model, tools = [], tool_choice, stream: requestStream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort, reasoning, opencode: requestOpencodeConfig } = req.body;
@@ -1880,7 +2173,9 @@ export function createApp(config) {
                         modelID: mID,
                         toolOverrides,
                         requestTimeoutMs: REQUEST_TIMEOUT_MS,
-                        forbidThinkBlock: true
+                        forbidThinkBlock: true,
+                        since: turnStartedAt,
+                        recoverNativeCalls: true
                     });
                     let requestForcedChatToolCall = makeForcedChatToolCallRequester();
 
@@ -2002,7 +2297,8 @@ export function createApp(config) {
                                     REQUEST_TIMEOUT_MS,
                                     sendDelta,
                                     DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                    DEFAULT_EVENT_IDLE_TIMEOUT_MS
+                                    DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+                                    { turnStartedAt, recoverNativeCalls: true }
                                 );
                                 const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                                 client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
@@ -2026,6 +2322,15 @@ export function createApp(config) {
                             }
                             break;
                         }
+
+                        // Tool calls recovered from OpenCode's native channel, where the
+                        // gateway's own tools are unknown to the backend (see
+                        // toNativeExternalCall). Their presence means this turn already
+                        // produced its answer, so the polling reconciliations below must
+                        // not run and replace it with the rejected call's fallout.
+                        let nativeStreamCalls = Array.isArray(collected?.nativeExternalCalls)
+                            ? collected.nativeExternalCalls
+                            : [];
 
                         if (collected && collected.__error) {
                             logDebug('SSE collect error, falling back to polling', {
@@ -2070,7 +2375,7 @@ export function createApp(config) {
                             if (collected.content) sendDelta(collected.content, false);
                         }
 
-                        if (!streamedContent && !streamedReasoning) {
+                        if (!streamedContent && !streamedReasoning && nativeStreamCalls.length === 0) {
                             logDebug('SSE returned empty, falling back to polling', { sessionId });
                             const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                             if (error && !content && !reasoning) {
@@ -2079,7 +2384,7 @@ export function createApp(config) {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
-                        } else if (streamedReasoning && !streamedContent) {
+                        } else if (streamedReasoning && !streamedContent && nativeStreamCalls.length === 0) {
                             // Reconciliation for reasoning models: the reasoning streamed but the
                             // answer text never arrived because every delta was tagged as reasoning
                             // (issue #9). The message snapshot separates the two correctly, so
@@ -2120,7 +2425,7 @@ export function createApp(config) {
                         let parsedToolCalls = streamedToolCalls.length > 0
                             ? streamedToolCalls
                             : parseStreamedToolCalls();
-                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                        if (parsedToolCalls.length === 0 && nativeStreamCalls.length === 0 && externalToolChoice.mode === 'required') {
                             const forcedResponse = await requestForcedChatToolCall();
                             if (forcedResponse) {
                                 parsedToolCalls = parseExternalToolCallsFromText(
@@ -2128,13 +2433,28 @@ export function createApp(config) {
                                     forcedResponse.reasoning,
                                     forcedResponse.content
                                 );
+                                // The retry may itself have been rejected on OpenCode's
+                                // native channel; keep those calls with this turn's.
+                                if (Array.isArray(forcedResponse.nativeExternalCalls)) {
+                                    nativeStreamCalls = [...nativeStreamCalls, ...forcedResponse.nativeExternalCalls];
+                                }
                             }
                         }
                         const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-                        const finalStreamedToolCalls = validatedStreamedToolCalls;
-                        if (finalStreamedToolCalls.length > 0 && streamedToolCalls.length === 0) {
-                            const toolCallDeltas = finalStreamedToolCalls.map((toolCall, index) => ({
-                                index,
+                        const { validCalls: validatedNativeStreamCalls } = nativeStreamCalls.length > 0
+                            ? finalizeValidatedToolCalls(restoreOriginalToolNames(nativeStreamCalls, externalToolRegistry), externalToolRegistry)
+                            : { validCalls: [] };
+                        const finalStreamedToolCalls = [...validatedStreamedToolCalls, ...validatedNativeStreamCalls];
+                        // Calls parsed out of streamed text went out chunk by chunk as their
+                        // blocks completed. Only what has not been sent yet is written here,
+                        // with indices continuing the ones the client already received.
+                        const emittedToolCallCount = streamedToolCalls.length;
+                        const unemittedToolCalls = emittedToolCallCount > 0
+                            ? validatedNativeStreamCalls
+                            : finalStreamedToolCalls;
+                        if (unemittedToolCalls.length > 0) {
+                            const toolCallDeltas = unemittedToolCalls.map((toolCall, offset) => ({
+                                index: emittedToolCallCount + offset,
                                 id: toolCall.id,
                                 type: 'function',
                                 function: {
@@ -2175,10 +2495,15 @@ export function createApp(config) {
                         res.write('data: [DONE]\n\n');
                         res.end();
                         turnCompleted = true;
+                        recordCompletion('chat-stream');
                     } else {
                         let content = '';
                         let reasoning = '';
                         let error = null;
+                        // Recovered calls from OpenCode's native channel (see
+                        // toNativeExternalCall). Set per attempt because a retry runs in
+                        // a fresh session and starts over.
+                        let nativeCalls = [];
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session: the failed attempt left an errored
@@ -2199,10 +2524,18 @@ export function createApp(config) {
                             const attemptStart = Date.now();
                             await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                             logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
-                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const collected = await pollForAssistantResponse(
+                                sessionId,
+                                REQUEST_TIMEOUT_MS,
+                                DEFAULT_POLL_INTERVAL_MS,
+                                { since: attemptStart, recoverNativeCalls: true }
+                            );
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
                             error = collected.error || null;
+                            nativeCalls = Array.isArray(collected.nativeExternalCalls)
+                                ? collected.nativeExternalCalls
+                                : [];
                             // Bounded retry for upstream throttling mislabeled as billing
                             // errors (401 CreditsError etc.); only when nothing usable was
                             // produced, so real failures still surface after RETRY_MAX_ATTEMPTS.
@@ -2218,7 +2551,7 @@ export function createApp(config) {
                             }
                             break;
                         }
-                        if (error && !content && !reasoning) {
+                        if (error && !content && !reasoning && nativeCalls.length === 0) {
                             return res.status(502).json({
                                 error: {
                                     message: error.data?.message || error.message || 'OpenCode provider error',
@@ -2229,15 +2562,24 @@ export function createApp(config) {
                         let parsedToolCalls = externalToolRegistry.length > 0
                             ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
                             : [];
-                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                        if (parsedToolCalls.length === 0 && nativeCalls.length === 0 && externalToolChoice.mode === 'required') {
                             const forcedResponse = await requestForcedChatToolCall();
                             if (forcedResponse) {
                                 content = forcedResponse.content || content;
                                 reasoning = forcedResponse.reasoning || reasoning;
                                 parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                                // The retry may itself have been rejected on OpenCode's
+                                // native channel; keep those calls with this turn's.
+                                if (Array.isArray(forcedResponse.nativeExternalCalls)) {
+                                    nativeCalls = [...nativeCalls, ...forcedResponse.nativeExternalCalls];
+                                }
                             }
                         }
                         const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                    const { validCalls: validatedNativeCalls } = nativeCalls.length > 0
+                        ? finalizeValidatedToolCalls(restoreOriginalToolNames(nativeCalls, externalToolRegistry), externalToolRegistry)
+                            : { validCalls: [] };
+                        const allValidatedToolCalls = [...validatedToolCalls, ...validatedNativeCalls];
                         const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
                         const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
@@ -2246,7 +2588,7 @@ export function createApp(config) {
                         const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
                         const totalTokens = promptTokens + completionTokensCalc + reasoningTokensCalc;
 
-                        const publicValidatedToolCalls = toPublicToolCalls(validatedToolCalls);
+                        const publicValidatedToolCalls = toPublicToolCalls(allValidatedToolCalls);
                         // Reasoning is emitted in its own `reasoning_content` field so clients
                         // can surface the thinking without it being wrapped in <think> tags and
                         // mixed into the answer `content`.
@@ -2281,6 +2623,7 @@ export function createApp(config) {
                             }
                         });
                         turnCompleted = true;
+                        recordCompletion('chat');
                     }
                 } catch (error) {
                     console.error('[Proxy] API Error:', error.message);
@@ -2330,11 +2673,7 @@ export function createApp(config) {
         }
     });
 
-    const hasValidBearerAuth = (req) => {
-        if (!API_KEY || API_KEY.trim() === '') return true;
-        const authHeader = req.headers.authorization;
-        return Boolean(authHeader && authHeader === `Bearer ${API_KEY}`);
-    };
+    const hasValidBearerAuth = (req) => isAuthorized(req.headers.authorization, config.API_KEY).ok;
 
     const shouldAllowOperationalEndpoint = (req, { enabled, requireAuth }) => {
         if (!enabled) return false;
@@ -3010,6 +3349,7 @@ export function createApp(config) {
                 emit({ type: 'response.completed', sequence_number: nextSeq(), response });
                 res.write('data: [DONE]\n\n');
                 storeResponseState(responseId, sessionId, `${pID}/${mID}`);
+                recordCompletion('responses');
                 return res.end();
             }
 
@@ -3089,6 +3429,7 @@ export function createApp(config) {
 
             storeResponseState(responseId, sessionId, `${pID}/${mID}`);
 
+            recordCompletion('responses');
             return res.json(response);
         } catch (error) {
             console.error('[Proxy] Responses API Error:', error?.message || error?.data?.message || error?.name || error);
@@ -3294,9 +3635,11 @@ async function ensureBackend(config) {
         };
 
         const spawnArgs = ['serve', '--port', port, '--hostname', '127.0.0.1'];
-        if (ZEN_API_KEY) {
-            spawnArgs.push('--password', ZEN_API_KEY);
-        }
+        // opencode serve has no --password flag (passing one prints usage and exits 1);
+        // it reads OPENCODE_SERVER_PASSWORD from the environment instead. Force the
+        // exact value the gateway authenticates with, otherwise the backend enforces a
+        // password the gateway doesn't know and every call returns 401.
+        spawnOptions.env = { ...envVars, OPENCODE_SERVER_PASSWORD };
         state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
 
         // Handle spawn errors
@@ -3432,6 +3775,10 @@ export function startProxy(options) {
     
     const server = app.listen(config.PORT, config.BIND_HOST, async () => {
         console.log(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
+        for (const endpoint of lanEndpoints(config.PORT, config.BIND_HOST)) {
+            console.log(`[Proxy]   ${endpoint.label}: ${endpoint.url}`);
+        }
+        console.log('[Proxy]   WebUI: 在浏览器打开上述任一地址即可');
         try {
             await ensureBackend(config);
         } catch (error) {

@@ -39,6 +39,43 @@ function readConfig() {
   }
 }
 
+// A bare command like "opencode" can never be checked with fs.existsSync on
+// Windows: the real file is an .exe behind an opencode.cmd shim, so existsSync
+// returns false and a fresh clone dies here for no reason. Resolve explicitly.
+const isWin = process.platform === 'win32';
+
+function resolveBackendBin(bin) {
+  if (!bin) return null;
+  if (bin.includes('/') || bin.includes('\\')) return fs.existsSync(bin) ? bin : null;
+
+  const exe = isWin ? `${bin}.exe` : bin;
+  const roots = [
+    __dirname,
+    path.join(process.env.APPDATA || '', 'npm', 'node_modules'),
+    path.join(process.env.npm_config_prefix || '', 'lib', 'node_modules'),
+    '/usr/local/lib/node_modules',
+    '/usr/lib/node_modules',
+  ];
+  for (const root of roots) {
+    if (!root || root === 'node_modules') continue;
+    const candidate = path.join(root, 'node_modules', 'opencode-ai', 'bin', exe);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  try {
+    const out = execSync(isWin ? `where ${bin}` : `command -v ${bin}`, {
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+    });
+    const first = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0];
+    if (first && fs.existsSync(first)) return first;
+  } catch { /* not on PATH */ }
+  return null;
+}
+
+const needsShell = bin => /\.(cmd|bat|ps1)$/i.test(bin);
+
 function pidsOnPort(port) {
   try {
     const out = execSync('netstat -ano -p tcp', {
@@ -96,15 +133,19 @@ async function waitFor(url, { attempts = 45, intervalMs = 1000, timeoutMs = 3000
   return { reached: false, status: 0, ok: false };
 }
 
-function spawnLogged(name, bin, args) {
+function spawnLogged(name, bin, args, extraEnv = {}) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   const out = fs.openSync(path.join(LOG_DIR, `${name}.log`), 'a');
   const err = fs.openSync(path.join(LOG_DIR, `${name}.err.log`), 'a');
-  const child = spawn(bin, args, {
+  // Node refuses to exec .cmd/.bat directly, so a PATH-resolved shim needs a shell.
+  const useShell = needsShell(bin);
+  const child = spawn(bin, useShell ? args.map(a => (/\s/.test(a) ? `"${a}"` : a)) : args, {
     cwd: __dirname,
     detached: true,
     stdio: ['ignore', out, err],
     windowsHide: true,
+    shell: useShell,
+    env: { ...process.env, ...extraEnv },
   });
   child.unref();
   return child;
@@ -132,8 +173,12 @@ async function start() {
   const serverUrl = cfg.OPENCODE_SERVER_URL || 'http://127.0.0.1:10001';
   let serverPort = 10001;
   try { serverPort = Number(new URL(serverUrl).port) || 10001; } catch { /* keep default */ }
-  const backendBin = cfg.OPENCODE_PATH || 'opencode';
-  const password = cfg.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD || '';
+  const backendBin = resolveBackendBin(cfg.OPENCODE_PATH || 'opencode');
+  // Must use the SAME precedence as index.js (env > file): index.js builds the
+  // gateway's Basic auth from `process.env.OPENCODE_SERVER_PASSWORD` first, so if
+  // this launcher preferred the file the backend would enforce a different
+  // password than the gateway sends, and every call would come back 401.
+  const password = process.env.OPENCODE_SERVER_PASSWORD || cfg.OPENCODE_SERVER_PASSWORD || '';
   const username = process.env.OPENCODE_SERVER_USERNAME || 'opencode';
   const apiKey = cfg.API_KEY || '';
 
@@ -141,9 +186,12 @@ async function start() {
   say(c.bold('opencode2api  ' + c.dim('- local dev launcher')));
   say('');
 
-  if (!fs.existsSync(backendBin)) {
-    die(`OpenCode binary not found:\n       ${backendBin}\n       Run: npm install --no-save opencode-ai@1.18.33`);
+  if (!backendBin) {
+    die(`OpenCode not found (OPENCODE_PATH: ${cfg.OPENCODE_PATH || 'opencode'}).
+       Install it:   npm install -g opencode-ai
+       Or set OPENCODE_PATH in config.json to the full path of opencode(.exe)`);
   }
+  say(c.dim(`backend bin ${backendBin}`));
   if (!fs.existsSync(path.join(__dirname, 'node_modules', 'express'))) {
     die('node_modules is missing. Run: npm install');
   }
@@ -154,7 +202,12 @@ async function start() {
   await sleep(1200);
 
   say(c.dim('starting OpenCode backend'));
-  spawnLogged('backend', backendBin, ['serve', '--hostname', '127.0.0.1', '--port', String(serverPort)]);
+  // opencode serve only runs unsecured when OPENCODE_SERVER_PASSWORD is present but
+  // empty; if the variable is missing entirely it enforces an unknown password and
+  // every gateway call comes back 401. So pass it explicitly, even when blank.
+  spawnLogged('backend', backendBin, ['serve', '--hostname', '127.0.0.1', '--port', String(serverPort)], {
+    OPENCODE_SERVER_PASSWORD: password,
+  });
 
   const authHeaders = password
     ? { Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}` }
